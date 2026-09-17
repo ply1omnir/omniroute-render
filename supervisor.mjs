@@ -20,6 +20,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { spawn } from "node:child_process";
 import { downloadAsset, latestSnapshot, tagToDate } from "./github.mjs";
+import { performSnapshot } from "./snapshot-core.mjs";
 
 const PORT = Number(process.env.PORT || 10000);
 const APP_PORT = Number(process.env.APP_PORT || 20128);
@@ -88,44 +89,23 @@ async function restore() {
 }
 
 // ── 2. snapshot trigger ─────────────────────────────────────────────────────
-function runSnapshot(mode) {
-  return new Promise(function (resolve) {
-    state.snapshotsRunning++;
-    // The snapshot is a third Node process on a 512Mi instance (supervisor +
-    // OmniRoute + snapshot). Measured on Render free tier: three unbounded Node
-    // processes OOM-killed the container. Give this one a small, explicit heap.
-    const snapEnv = Object.assign({}, process.env, {
-      NODE_OPTIONS: "--max-old-space-size=128",
-    });
-    const child = spawn(process.execPath, [path.join(APP_CWD, "snapshot.mjs"), mode], {
-      cwd: APP_CWD,
-      env: snapEnv,
-      execArgv: ["--max-old-space-size=128"],
-    });
-    let out = "";
-    let err = "";
-    child.stdout.on("data", function (d) {
-      out += d.toString();
-    });
-    child.stderr.on("data", function (d) {
-      err += d.toString();
-    });
-    child.on("close", function (code) {
-      state.snapshotsRunning--;
-      let parsed = null;
-      const line = out.trim().split("\n").pop();
-      try {
-        parsed = JSON.parse(line);
-      } catch (e) {
-        parsed = { ok: false, error: "unparsable snapshot output", raw: out.slice(0, 500) };
-      }
-      parsed.exitCode = code;
-      if (err) parsed.stderr = err.slice(0, 500);
-      state.lastSnapshot = { at: new Date().toISOString(), mode: mode, result: parsed };
-      log("snapshot(" + mode + ") finished: " + JSON.stringify(parsed).slice(0, 400));
-      resolve(parsed);
-    });
-  });
+async function runSnapshot(mode) {
+  // Runs IN-PROCESS on purpose: a third Node process for the snapshot was
+  // measured to push this 512Mi container into a Render OOM kill.
+  state.snapshotsRunning++;
+  try {
+    const parsed = await performSnapshot(mode);
+    state.lastSnapshot = { at: new Date().toISOString(), mode: mode, result: parsed };
+    log("snapshot(" + mode + ") finished: " + JSON.stringify(parsed).slice(0, 400));
+    return parsed;
+  } catch (err) {
+    const parsed = { ok: false, error: err && err.message ? err.message : String(err) };
+    state.lastSnapshot = { at: new Date().toISOString(), mode: mode, result: parsed };
+    log("snapshot(" + mode + ") threw: " + parsed.error);
+    return parsed;
+  } finally {
+    state.snapshotsRunning--;
+  }
 }
 
 async function maybeDailySnapshot() {
