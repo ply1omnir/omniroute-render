@@ -76,8 +76,14 @@ export async function listSnapshots() {
     }
     if (batch.length < 100) break;
   }
+  // Sort by the timestamp embedded in OUR tag, never by GitHub's created_at:
+  // releases created in quick succession can share (or misreport) created_at,
+  // and picking the wrong one silently restores a stale configuration.
   out.sort(function (a, b) {
-    return String(b.createdAt).localeCompare(String(a.createdAt));
+    const da = tagToDate(a.tag);
+    const db = tagToDate(b.tag);
+    if (da && db && da.getTime() !== db.getTime()) return db.getTime() - da.getTime();
+    return String(b.tag).localeCompare(String(a.tag));
   });
   return out;
 }
