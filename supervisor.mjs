@@ -91,9 +91,16 @@ async function restore() {
 function runSnapshot(mode) {
   return new Promise(function (resolve) {
     state.snapshotsRunning++;
+    // The snapshot is a third Node process on a 512Mi instance (supervisor +
+    // OmniRoute + snapshot). Measured on Render free tier: three unbounded Node
+    // processes OOM-killed the container. Give this one a small, explicit heap.
+    const snapEnv = Object.assign({}, process.env, {
+      NODE_OPTIONS: "--max-old-space-size=128",
+    });
     const child = spawn(process.execPath, [path.join(APP_CWD, "snapshot.mjs"), mode], {
       cwd: APP_CWD,
-      env: process.env,
+      env: snapEnv,
+      execArgv: ["--max-old-space-size=128"],
     });
     let out = "";
     let err = "";
@@ -341,7 +348,9 @@ async function main() {
       log("WARNING: CONTROL_TOKEN not set — manual snapshot endpoint is disabled");
     }
   });
-  setTimeout(maybeDailySnapshot, 5 * 60 * 1000);
+  // Delay the first scheduled snapshot: the app needs its startup memory
+  // headroom first, and an immediate snapshot stacks a third process on top.
+  setTimeout(maybeDailySnapshot, 10 * 60 * 1000);
   setInterval(maybeDailySnapshot, AUTO_CHECK_MS);
 }
 
