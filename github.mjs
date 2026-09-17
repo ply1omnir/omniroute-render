@@ -20,6 +20,8 @@ export function configRepo() {
   return r.trim();
 }
 
+const REQUEST_TIMEOUT_MS = 60000;
+
 export async function gh(path, options) {
   const opts = options || {};
   const headers = Object.assign(
@@ -31,8 +33,18 @@ export async function gh(path, options) {
     },
     opts.headers || {}
   );
-  const res = await fetch(API + path, Object.assign({}, opts, { headers: headers }));
+  // Node's fetch has NO default timeout. Without this a stalled connection to
+  // GitHub hangs the caller forever — measured as a manual snapshot that never
+  // returned a response at all.
+  const signal = opts.signal || AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const res = await fetch(API + path, Object.assign({}, opts, { headers: headers, signal: signal }));
   return res;
+}
+
+function sleep(ms) {
+  return new Promise(function (r) {
+    setTimeout(r, ms);
+  });
 }
 
 async function ghJson(path, options) {
@@ -102,6 +114,7 @@ export async function downloadAsset(assetId) {
   const repo = configRepo();
   const res = await gh("/repos/" + repo + "/releases/assets/" + assetId, {
     headers: { Accept: "application/octet-stream" },
+    signal: AbortSignal.timeout(120000),
   });
   if (!res.ok) {
     throw new Error("asset " + assetId + " download failed: " + res.status);
@@ -132,21 +145,42 @@ export async function publishSnapshot(tag, bodyText, gzBuffer, assetName) {
     release.id +
     "/assets?name=" +
     encodeURIComponent(assetName);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer " + requiredToken(),
-      "Content-Type": "application/gzip",
-      "User-Agent": UA,
-    },
-    body: gzBuffer,
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error("asset upload failed: " + res.status + " " + text.slice(0, 300));
+
+  // The upload host has been observed returning transient 5xx
+  // ("Error creating asset temp dir"). Retry, and if it still fails, delete the
+  // release we just created so we never leave asset-less releases behind.
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + requiredToken(),
+          "Content-Type": "application/gzip",
+          "User-Agent": UA,
+        },
+        body: gzBuffer,
+        signal: AbortSignal.timeout(120000),
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        lastError = "asset upload failed: " + res.status + " " + text.slice(0, 200);
+      } else {
+        const asset = JSON.parse(text);
+        return { tag: tag, releaseId: release.id, assetId: asset.id, size: gzBuffer.length, attempts: attempt };
+      }
+    } catch (err) {
+      lastError = "asset upload threw: " + (err && err.message ? err.message : String(err));
+    }
+    if (attempt < 3) await sleep(attempt * 3000);
   }
-  const asset = JSON.parse(text);
-  return { tag: tag, releaseId: release.id, assetId: asset.id, size: gzBuffer.length };
+
+  try {
+    await deleteRelease(release.id);
+  } catch (e) {
+    // best effort
+  }
+  throw new Error(lastError || "asset upload failed");
 }
 
 /** Delete a release together with its assets. */
