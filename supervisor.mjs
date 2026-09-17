@@ -142,6 +142,73 @@ function sendJson(res, code, obj) {
   res.end(body);
 }
 
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return String(n);
+  return Math.round(n / 1048576) + " MiB";
+}
+
+// Container-level memory picture. Render's free instance caps the container at
+// 512 MiB, and the only way to see the real breakdown (who is eating it) is to
+// read the cgroup counters and per-process RSS from inside the container.
+function readMemoryReport() {
+  const out = { meminfo: {}, cgroup: {}, processes: [], supervisor: null, appHeapLimitMb: null };
+  try {
+    const mi = fs.readFileSync("/proc/meminfo", "utf8");
+    for (const line of mi.split("\n")) {
+      const m = /^(MemTotal|MemAvailable|MemFree|SwapTotal|SwapFree):\s+(\d+)\s*kB/.exec(line);
+      if (m) out.meminfo[m[1]] = fmtBytes(Number(m[2]) * 1024);
+    }
+  } catch (e) {
+    out.meminfo.error = String(e.message || e);
+  }
+  const cg = [
+    ["v2_current", "/sys/fs/cgroup/memory.current"],
+    ["v2_max", "/sys/fs/cgroup/memory.max"],
+    ["v2_peak", "/sys/fs/cgroup/memory.peak"],
+    ["v1_usage", "/sys/fs/cgroup/memory/memory.usage_in_bytes"],
+    ["v1_limit", "/sys/fs/cgroup/memory/memory.limit_in_bytes"],
+  ];
+  for (const pair of cg) {
+    try {
+      const raw = fs.readFileSync(pair[1], "utf8").trim();
+      out.cgroup[pair[0]] = raw === "max" ? "max" : fmtBytes(Number(raw));
+    } catch (e) {
+      // not present on this cgroup version
+    }
+  }
+  try {
+    for (const d of fs.readdirSync("/proc")) {
+      if (!/^[0-9]+$/.test(d)) continue;
+      try {
+        const st = fs.readFileSync("/proc/" + d + "/status", "utf8");
+        const nameM = /^Name:\s+(.+)$/m.exec(st);
+        const rssM = /^VmRSS:\s+([0-9]+)\s+kB/m.exec(st);
+        const rss = rssM ? Number(rssM[1]) : 0;
+        if (rss > 0) {
+          out.processes.push({ pid: Number(d), name: nameM ? nameM[1] : "?", rssMiB: Math.round(rss / 1024) });
+        }
+      } catch (e) {
+        // process vanished
+      }
+    }
+    out.processes.sort(function (a, b) {
+      return b.rssMiB - a.rssMiB;
+    });
+  } catch (e) {
+    out.processesError = String(e.message || e);
+  }
+  const mu = process.memoryUsage();
+  out.supervisor = {
+    rssMiB: Math.round(mu.rss / 1048576),
+    heapUsedMiB: Math.round(mu.heapUsed / 1048576),
+    heapTotalMiB: Math.round(mu.heapTotal / 1048576),
+    externalMiB: Math.round((mu.external || 0) / 1048576),
+  };
+  out.appHeapLimitMb = process.env.OMNIROUTE_MEMORY_MB || null;
+  out.appPid = state.appPid;
+  return out;
+}
+
 async function handleControl(req, res, url) {
   if (!CONTROL_TOKEN) {
     sendJson(res, 503, { error: "control endpoint disabled: CONTROL_TOKEN not configured" });
@@ -176,6 +243,10 @@ async function handleControl(req, res, url) {
       requested: "manual snapshot",
       result: result,
     });
+    return true;
+  }
+  if (action === "mem" || action === "memory") {
+    sendJson(res, 200, readMemoryReport());
     return true;
   }
   if (action === "restore-info") {
